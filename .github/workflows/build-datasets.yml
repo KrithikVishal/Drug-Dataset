@@ -1,0 +1,271 @@
+name: Build and Upload Dataset Artifacts
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Run weekly on Sundays at 2 AM UTC
+    - cron: '0 2 * * 0'
+  workflow_dispatch:
+    inputs:
+      limit_chembl:
+        description: 'Limit ChEMBL records'
+        required: false
+        default: '1000'
+        type: string
+      datasets:
+        description: 'Datasets to build (comma-separated: dti,admet,molecule-pool)'
+        required: false
+        default: 'dti,admet,molecule-pool'
+        type: string
+
+jobs:
+  build-datasets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    
+    strategy:
+      matrix:
+        python-version: [3.9, 3.10]
+        
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+        
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+          
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libxrender1 libxtst6 libxi6 libgl1-mesa-glx
+        
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: Lint code
+      run: |
+        flake8 scripts/ connectors/ features/ --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 scripts/ connectors/ features/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+        
+    - name: Format code check
+      run: |
+        black --check scripts/ connectors/ features/
+        
+    - name: Run tests
+      run: |
+        python -m pytest tests/ -v --tb=short
+      continue-on-error: true
+        
+    - name: Create output directory
+      run: mkdir -p data/
+      
+    - name: Determine build parameters
+      id: build-params
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "limit=${{ github.event.inputs.limit_chembl }}" >> $GITHUB_OUTPUT
+          echo "datasets=${{ github.event.inputs.datasets }}" >> $GITHUB_OUTPUT
+        else
+          echo "limit=1000" >> $GITHUB_OUTPUT
+          echo "datasets=dti,admet,molecule-pool" >> $GITHUB_OUTPUT
+        fi
+        
+    - name: Build DTI dataset
+      if: contains(steps.build-params.outputs.datasets, 'dti')
+      run: |
+        python scripts/build_datasets.py --dti --chembl --uniprot \
+          --limit-chembl ${{ steps.build-params.outputs.limit }} \
+          --out data/ --log-level INFO
+          
+    - name: Build ADMET dataset
+      if: contains(steps.build-params.outputs.datasets, 'admet')
+      run: |
+        python scripts/build_datasets.py --admet --chembl \
+          --limit-chembl ${{ steps.build-params.outputs.limit }} \
+          --out data/ --log-level INFO
+          
+    - name: Build Molecule Pool
+      if: contains(steps.build-params.outputs.datasets, 'molecule-pool')
+      run: |
+        python scripts/build_datasets.py --molecule-pool --chembl \
+          --limit-chembl ${{ steps.build-params.outputs.limit }} \
+          --out data/ --log-level INFO
+          
+    - name: Validate generated datasets
+      run: |
+        python -c "
+        import pandas as pd
+        import os
+        
+        # Check if files exist and are readable
+        data_dir = 'data/'
+        expected_files = []
+        
+        datasets = '${{ steps.build-params.outputs.datasets }}'.split(',')
+        
+        if 'dti' in datasets:
+          expected_files.extend(['dti_meta.csv', 'dti_vectors.parquet'])
+        if 'admet' in datasets:
+          expected_files.extend(['admet_meta.csv', 'admet_vectors.parquet'])
+        if 'molecule-pool' in datasets:
+          expected_files.extend(['molecule_pool_meta.csv', 'molecule_pool_vectors.parquet'])
+        
+        for file in expected_files:
+          path = os.path.join(data_dir, file)
+          if not os.path.exists(path):
+            print(f'ERROR: Missing file {path}')
+            exit(1)
+          
+          # Basic validation
+          if file.endswith('.csv'):
+            df = pd.read_csv(path)
+            print(f'{file}: {len(df)} rows, {len(df.columns)} columns')
+          elif file.endswith('.parquet'):
+            df = pd.read_parquet(path)
+            print(f'{file}: {len(df)} rows, {len(df.columns)} columns')
+            
+        print('All datasets validated successfully!')
+        "
+        
+    - name: Generate dataset summary
+      run: |
+        python -c "
+        import pandas as pd
+        import json
+        import os
+        from datetime import datetime
+        
+        summary = {
+          'build_date': datetime.now().isoformat(),
+          'python_version': '${{ matrix.python-version }}',
+          'limit_chembl': int('${{ steps.build-params.outputs.limit }}'),
+          'datasets': '${{ steps.build-params.outputs.datasets }}'.split(','),
+          'files': {}
+        }
+        
+        data_dir = 'data/'
+        for file in os.listdir(data_dir):
+          if file.endswith(('.csv', '.parquet')):
+            path = os.path.join(data_dir, file)
+            size_mb = os.path.getsize(path) / (1024 * 1024)
+            
+            if file.endswith('.csv'):
+              df = pd.read_csv(path)
+            else:
+              df = pd.read_parquet(path)
+              
+            summary['files'][file] = {
+              'size_mb': round(size_mb, 2),
+              'rows': len(df),
+              'columns': len(df.columns)
+            }
+        
+        with open('data/build_summary.json', 'w') as f:
+          json.dump(summary, f, indent=2)
+          
+        print('Generated build summary:', json.dumps(summary, indent=2))
+        "
+        
+    - name: Upload dataset artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: drug-dataset-${{ matrix.python-version }}-${{ github.sha }}
+        path: |
+          data/*.csv
+          data/*.parquet
+          data/*.json
+          pipeline.log
+        retention-days: 30
+        
+    - name: Upload to release (if tag)
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          data/*.csv
+          data/*.parquet
+          data/*.json
+        token: ${{ secrets.GITHUB_TOKEN }}
+        
+  test-datasets:
+    needs: build-datasets
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: 3.9
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pandas pyarrow pytest
+        
+    - name: Download artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: drug-dataset-3.9-${{ github.sha }}
+        path: data/
+        
+    - name: Test dataset integrity
+      run: |
+        python -c "
+        import pandas as pd
+        import json
+        import os
+        
+        # Load build summary
+        with open('data/build_summary.json', 'r') as f:
+          summary = json.load(f)
+          
+        print('Testing dataset integrity...')
+        
+        # Basic integrity tests
+        for filename, info in summary['files'].items():
+          if not filename.endswith(('.csv', '.parquet')):
+            continue
+            
+          path = f'data/{filename}'
+          
+          # Check file exists
+          assert os.path.exists(path), f'File {filename} not found'
+          
+          # Load and validate
+          if filename.endswith('.csv'):
+            df = pd.read_csv(path)
+          else:
+            df = pd.read_parquet(path)
+            
+          # Check row count matches summary
+          assert len(df) == info['rows'], f'Row count mismatch for {filename}'
+          
+          # Check for required columns
+          if 'meta' in filename:
+            assert 'molecule_id' in df.columns, f'Missing molecule_id in {filename}'
+          elif 'vectors' in filename:
+            assert 'molecule_id' in df.columns, f'Missing molecule_id in {filename}'
+            
+          print(f'✓ {filename}: {len(df)} rows, {len(df.columns)} columns')
+          
+        print('All tests passed!')
+        "
